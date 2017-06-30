@@ -1,0 +1,190 @@
+Linux Server - framework design
+
+1. Sync & Block
+
+    bind(srvfd);
+    listen(srvfd);
+    for(;;){
+        client_fd = accept(srvfd,...); // Acception of connect from clients
+        read(client_fd,req,...);       // Read request
+        resp = handle_request(req);    // Processing <handle request>
+        write(client_fd,resp);         // Response to clients
+    }
+
+NOTE: this mode will block during accept & read & write operation and hard to handle high frequency request.
+
+2. Multi-Processing
+
+    bind(srvfd);
+    listen(srvfd);
+    for(;;){
+        clifd = accept(srvfd,...);     // Acception of connect from clients
+        ret = fork();
+        switch( ret )
+        {
+          case -1 :
+            do_err_handler();
+            break;
+          case 0  :   // child
+            client_handler(client_fd);
+            break ;
+          default :   // parent
+            close(client_fd);
+            continue ;
+        }
+    }
+
+    
+    void client_handler(client_fd){
+        read(client_fd,req,...);       // Read requests
+        resp = handle_request(req);    // Processing <handle request>
+        write(client_fd,resp);         // Response to clients
+    } 
+
+NOTE: this mode has obviously optimazation compare to the Sync mode and only will block in accept operation. but it 
+still too heavy framework which required fork many of process.
+
+3. Multi-threading
+
+    void *thread_callback( void *args )     // Thread-main
+    {
+            int client_fd = *(int *)args ;
+            client_handler(client_fd);
+    }
+    
+    void client_handler(client_fd){
+        read(client_fd,req,...);            // Read request
+        resp = handle_request(req);         // Processing
+        write(client_fd,resp)               // Response to clients
+    }
+    
+    /* Main Logic */
+    bind(srvfd);
+    listen(srvfd);
+    for(;;){
+        client_fd = accept();
+        pthread_create(...,thread_callback,&client_fd);
+    }
+
+NOTE: compare to process based, threads is easy to create and destroy. but one thread broken will crash the whole process.
+more, write the "thread-safe" code is too complex and easy led to dead lock.
+
+4. IO mux (select/poll/epoll)
+
+    bind(listenfd);
+    listen(listenfd);
+    FD_ZERO(&allset);
+    FD_SET(listenfd, &allset);
+    for(;;){
+        select(maxfd, &rset,...);
+        if (FD_ISSET(listenfd, &rset)) {   // has requests?
+            client_fd = accept();
+            clients_array[] = client_fd;      
+            FD_SET(client_fd, &allset); 
+        }
+        for(;;){                           // handle requests available one by one.
+            fd = clients_array[i];
+            if (FD_ISSET(fd , &rset))
+                handle_request();          // read/process/response.
+        }
+    }
+
+NOTE: this mode will not block waiting for the requests, and make the main process can handle the request during the gap of
+the requests. also no need to fork too many process or create multiple threads. but the polling mechanism has performance
+issue, can be use epoll instead according to business detail.
+
+Epoll example:
+
+    stenfd = socket_bind(IPADDRESS,PORT);
+    struct epoll_event events[EPOLLEVENTS];
+
+    epollfd = epoll_create(FDSIZE);
+    add_event(epollfd,listenfd,EPOLLIN);
+
+    //Loop
+    for ( ; ; ){
+        ret = epoll_wait(epollfd,events,EPOLLEVENTS,-1);
+        handle_events(epollfd,events,ret,listenfd,buf);    //handle request
+    }
+
+    static void handle_events(int epollfd,struct epoll_event *events,int num,int listenfd,char *buf)
+    {
+        for (int i = 0;i < num;i++)  // num is only the readable io request
+        {
+            int fd = events[i].data.fd;
+
+            if ((fd == listenfd) &&(events[i].events & EPOLLIN))
+               handle_accpet(epollfd,listenfd);
+            else if (events[i].events & EPOLLIN)
+               do_read(epollfd,fd,buf);
+            else if (events[i].events & EPOLLOUT)
+               do_write(epollfd,fd,buf);
+        }
+    }  
+
+
+    static void handle_accpet(int epollfd,int listenfd){
+         int clifd;     
+         struct sockaddr_in cliaddr;     
+         socklen_t  cliaddrlen;     
+         clifd = accept(listenfd,(struct sockaddr*)&cliaddr,&cliaddrlen);     
+         if (clifd == -1)         
+             perror("accpet error:");     
+         else {         
+             printf("accept a new client: %s:%d\n",inet_ntoa(cliaddr.sin_addr),cliaddr.sin_port);         
+             add_event(epollfd,clifd,EPOLLIN);     
+         } 
+    }
+
+    static void do_read(int epollfd,int fd,char *buf){
+        int nread;
+        nread = read(fd,buf,MAXSIZE);
+        if (nread == -1)     {         
+            perror("read error:");         
+            close(fd);
+            delete_event(epollfd,fd,EPOLLIN);
+        }
+        else if (nread == 0)     {         
+            fprintf(stderr,"client close.\n");
+            close(fd);
+            delete_event(epollfd,fd,EPOLLIN);
+        }     
+        else {         
+             printf("read message is : %s",buf);              
+             modify_event(epollfd,fd,EPOLLOUT);     
+        } 
+    }
+
+    static void do_write(int epollfd,int fd,char *buf) {     
+        int nwrite;     
+        nwrite = write(fd,buf,strlen(buf));     
+        if (nwrite == -1){         
+            perror("write error:");        
+            close(fd);       
+            delete_event(epollfd,fd,EPOLLOUT);
+        }else{
+            modify_event(epollfd,fd,EPOLLIN); 
+        }    
+        memset(buf,0,MAXSIZE); 
+    }
+
+    static void add_event(int epollfd,int fd,int state){
+        struct epoll_event ev;
+        ev.events = state;
+        ev.data.fd = fd;
+        epoll_ctl(epollfd,EPOLL_CTL_ADD,fd,&ev);
+    }
+    
+    static void delete_event(int epollfd,int fd,int state) {
+        struct epoll_event ev;
+        ev.events = state;
+        ev.data.fd = fd;
+        epoll_ctl(epollfd,EPOLL_CTL_DEL,fd,&ev);
+    }
+
+    static void modify_event(int epollfd,int fd,int state){     
+        struct epoll_event ev;
+        ev.events = state;
+        ev.data.fd = fd;
+        epoll_ctl(epollfd,EPOLL_CTL_MOD,fd,&ev);
+    }
